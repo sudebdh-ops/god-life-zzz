@@ -1,4 +1,5 @@
 import { decodeBackup, encodeBackup, applyCommand, makePlans, deliverDue, dateKey } from './core.js';
+import { SyncEngine } from './sync-engine.js';
 
 let queue = Promise.resolve();
 function serial(task) {
@@ -13,6 +14,15 @@ async function read() {
 async function write(routines, plans) {
   await chrome.storage.local.set({ data: encodeBackup(routines), plans });
 }
+const engine = new SyncEngine(
+  async () => (await read()).routines,
+  async routines => {
+    const current = await read();
+    await write(routines, makePlans(routines, current.plans));
+  },
+  async () => (await chrome.storage.local.get('syncState')).syncState ?? {},
+  async state => chrome.storage.local.set({ syncState: state }),
+);
 async function notify(r, date) {
   if (await chrome.notifications.getPermissionLevel() !== 'granted') return false;
   await chrome.notifications.create(`${r.id}|${date}`, {
@@ -23,6 +33,9 @@ async function notify(r, date) {
   return true;
 }
 async function tick() {
+  if ((await engine.status()).personId) {
+    try { await engine.pull(); } catch (error) { console.warn('동기화:', error.message); }
+  }
   const data = await read();
   const plans = makePlans(data.routines, data.plans);
   const next = await deliverDue(data.routines, plans, notify);
@@ -44,9 +57,7 @@ chrome.notifications.onButtonClicked.addListener((id, index) => {
   if (index !== 0 || !id.includes('|')) return;
   serial(async () => {
     const [routineId, date] = id.split('|');
-    const data = await read();
-    const routines = applyCommand(data.routines, 'complete', { id: routineId, date });
-    await write(routines, makePlans(routines, data.plans));
+    await engine.mutate('complete', { id: routineId, date });
     await chrome.notifications.clear(id);
   });
 });
@@ -54,6 +65,10 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (sender.id !== chrome.runtime.id) return false;
   serial(async () => {
     if (message.type === 'read') return { routines: (await read()).routines };
+    if (message.type === 'syncStatus') return { sync: await engine.status() };
+    if (message.type === 'syncPull') return engine.pull();
+    if (message.type === 'syncConnect') return engine.connect(message.kind, message.name, message.code);
+    if (message.type === 'syncShare') return engine.share(message.id);
     if (message.type === 'permission') return { permission: await chrome.notifications.getPermissionLevel() };
     if (message.type === 'test') {
       if (await chrome.notifications.getPermissionLevel() !== 'granted') throw new Error('Windows 또는 Chrome 알림 설정을 확인해주세요.');
@@ -61,13 +76,13 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       return {};
     }
     const data = await read();
-    const routines = applyCommand(data.routines, message.type, message.payload);
-    await write(routines, makePlans(routines, data.plans));
+    const result = await engine.mutate(message.type, message.payload);
+    const routines = result.routines;
     for (const previous of data.routines) {
       const current = routines.find(r => r.id === previous.id);
       if (!current || !current.active || !current.reminderEnabled || current.completedDates.includes(dateKey())) await chrome.notifications.clear(`${previous.id}|${dateKey()}`);
     }
-    return { routines };
+    return result;
   }).then(result => respond({ ok: true, ...result }), error => respond({ ok: false, error: error.message }));
   return true;
 });
