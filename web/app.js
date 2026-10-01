@@ -1,8 +1,10 @@
 import { DAYS, dateKey, due, completed, streak, timeText, daysText, nextReminder, decodeBackup, encodeBackup, applyCommand, makePlans, deliverDue } from './core.js';
+import { SyncEngine } from './sync-engine.js';
 
 const extension = Boolean(globalThis.chrome?.runtime?.id && chrome.storage);
 const STORAGE = 'gatsaeng-web-v1';
 const PLAN_KEY = 'gatsaeng-web-plans-v1';
+const SYNC_KEY = 'gatsaeng-web-sync-v1';
 const $ = selector => document.querySelector(selector);
 const escape = value => String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 let routines = [];
@@ -14,6 +16,17 @@ let notificationPermission = 'default';
 let installedPrompt = null;
 let toastTimer;
 let pendingConfirmation = null;
+let sync = {};
+const engine = extension ? null : new SyncEngine(
+  async () => browserRead(),
+  async next => withLock(async () => {
+    const previous = JSON.parse(localStorage.getItem(PLAN_KEY) || '{}');
+    localStorage.setItem(STORAGE, encodeBackup(next));
+    localStorage.setItem(PLAN_KEY, JSON.stringify(makePlans(next, previous)));
+  }),
+  async () => JSON.parse(localStorage.getItem(SYNC_KEY) || '{}'),
+  async state => localStorage.setItem(SYNC_KEY, JSON.stringify(state)),
+);
 
 function toast(message) {
   clearTimeout(toastTimer);
@@ -36,6 +49,7 @@ async function withLock(task) {
 async function load() {
   try {
     routines = extension ? (await send({ type: 'read' })).routines : browserRead();
+    sync = extension ? (await send({ type: 'syncStatus' })).sync : await engine.status();
     notificationPermission = extension ? (await send({ type: 'permission' })).permission : ('Notification' in window ? Notification.permission : 'unsupported');
     readable = true;
   } catch (error) { readable = false; toast(`기록을 읽지 못했어요. 기존 데이터는 보존됩니다. ${error.message}`); }
@@ -44,17 +58,28 @@ async function load() {
 async function mutate(type, payload) {
   if (!readable) { toast('기록을 읽을 수 없어 변경을 멈췄어요.'); return false; }
   try {
-    if (extension) routines = (await send({ type, payload })).routines;
-    else await withLock(async () => {
-      const next = applyCommand(browserRead(), type, payload);
-      const previousPlans = JSON.parse(localStorage.getItem(PLAN_KEY) || '{}');
-      localStorage.setItem(STORAGE, encodeBackup(next));
-      localStorage.setItem(PLAN_KEY, JSON.stringify(makePlans(next, previousPlans)));
-      routines = next;
-    });
+    const result = extension ? await send({ type, payload }) : await engine.mutate(type, payload);
+    routines = result.routines;
+    sync = result.sync;
     render();
     return true;
-  } catch (error) { toast(error.message); return false; }
+  } catch (error) { render(); toast(error.message); return false; }
+}
+async function syncAction(type, values = {}) {
+  const result = extension ? await send({ type, ...values }) : type === 'syncPull'
+    ? await engine.pull() : type === 'syncShare' ? await engine.share(values.id)
+      : await engine.connect(values.kind, values.name, values.code);
+  routines = result.routines;
+  sync = result.sync;
+  render();
+}
+function shared(id) { return (sync.sharedIds ?? []).includes(id); }
+function friendStatus(routine) {
+  if (!shared(routine.id)) return '';
+  const friend = sync.snapshot?.members?.find(member => member.personId !== sync.personId);
+  if (!friend) return '<span class="small">공유 루틴 · 친구 초대 대기 중</span>';
+  const done = sync.snapshot.completions?.some(item => item.routineId === routine.id && item.personId === friend.personId && item.date === dateKey());
+  return `<span class="small">${escape(friend.displayName)}: ${done ? '오늘 완료 ✓' : '아직 미완료'}</span>`;
 }
 
 function render() {
@@ -88,22 +113,23 @@ function todayView() {
     ${notificationPermission !== 'granted' && routines.some(r => r.active && r.reminderEnabled) ? '<div class="permission-note"><span>루틴을 놓치지 않도록 알림을 켜주세요.</span><button data-action="settings">알림 설정 →</button></div>' : ''}
     <div class="dashboard-grid"><section><div class="section-head"><h3>오늘의 루틴</h3><small>${today.length}개의 작은 약속</small></div><div class="routine-list">${today.length ? today.map(r => {
       const isDone = completed(r, now); const count = streak(r, now);
-      return `<article class="routine-card ${isDone ? 'done' : ''}"><button class="check" data-action="complete" data-id="${r.id}" aria-label="${escape(r.title)} ${isDone ? '완료 취소' : '완료 체크'}" aria-pressed="${isDone}">✓</button><div class="routine-copy"><h3>${escape(r.title)}</h3>${r.note ? `<p>${escape(r.note)}</p>` : ''}<div class="meta-line"><span class="time-pill">${r.reminderEnabled ? timeText(r) + ' 알림' : '알림 없이 실천'}</span>${count ? `<span class="streak-pill">↗ 연속 ${count}회</span>` : ''}</div></div>${isDone ? '<span class="status-done">완료!</span>' : `<button class="text-button" data-action="edit" data-id="${r.id}" aria-label="${escape(r.title)} 수정">수정</button>`}</article>`;
+      return `<article class="routine-card ${isDone ? 'done' : ''}"><button class="check" data-action="complete" data-id="${r.id}" aria-label="${escape(r.title)} ${isDone ? '완료 취소' : '완료 체크'}" aria-pressed="${isDone}">✓</button><div class="routine-copy"><h3>${escape(r.title)}</h3>${r.note ? `<p>${escape(r.note)}</p>` : ''}<div class="meta-line"><span class="time-pill">${r.reminderEnabled ? timeText(r) + ' 알림' : '알림 없이 실천'}</span>${count ? `<span class="streak-pill">↗ 연속 ${count}회</span>` : ''}</div>${friendStatus(r)}</div>${isDone ? '<span class="status-done">완료!</span>' : `<button class="text-button" data-action="edit" data-id="${r.id}" aria-label="${escape(r.title)} 수정">수정</button>`}</article>`;
     }).join('') : emptyView(routines.length ? '오늘은 예정된 루틴이 없어요' : '좋은 하루의 첫 단추', routines.length ? '반복 요일은 ‘내 루틴’에서 바꿀 수 있어요.' : '물 마시기, 독서, 산책… 원하는 루틴을 직접 만들어보세요.')}</div></section>
     <aside class="dashboard-aside"><div class="side-card"><span class="eyebrow">MY PACE</span><div class="big-number">${percentage}<span class="small"> %</span></div><p>오늘의 루틴 달성률</p><div class="week-dots">${DAYS.map((day, i) => `<div class="week-dot ${i + 1 === (now.getDay() || 7) ? 'today' : ''}">${day}<span>${i + 1 === (now.getDay() || 7) ? '●' : '·'}</span></div>`).join('')}</div></div><div class="side-card note-card"><span class="seed" aria-hidden="true">✳</span><h3>작은 실천도 실천이니까.</h3><p>완벽한 하루보다<br>계속 이어가는 하루를 만들어요.</p></div><div class="side-card"><h3>다음 리마인더</h3><p style="margin-top:10px">${next ? `${escape(next.r.title)}<br><strong>${next.at.getMonth() + 1}/${next.at.getDate()} ${timeText(next.r)}</strong>` : '알림이 있는 루틴을 추가해보세요.'}</p></div></aside></div>`;
 }
 function routinesView() {
   return `<div class="page-intro"><div><span class="eyebrow">MADE FOR YOU</span><h1>내 루틴</h1><p>전체 ${routines.length}개 · 사용 중 ${routines.filter(r => r.active).length}개</p></div></div>
-    ${routines.length ? `<div class="all-routines">${routines.map(r => `<article class="manage-card"><div class="manage-head"><h3>${escape(r.title)}</h3><input class="switch" type="checkbox" data-action="active" data-id="${r.id}" aria-label="${escape(r.title)} 사용" ${r.active ? 'checked' : ''}></div><div class="meta-line"><span class="time-pill">${r.reminderEnabled ? timeText(r) + ' 알림' : '알림 꺼짐'}</span><span>${daysText(r)}</span></div>${r.note ? `<p>${escape(r.note)}</p>` : ''}${!r.active ? '<p class="small">잠시 쉬는 중 · 기록은 그대로 보관돼요.</p>' : ''}<div class="manage-actions"><button class="text-button danger" data-action="delete" data-id="${r.id}">삭제</button><button class="text-button" data-action="edit" data-id="${r.id}">수정</button></div></article>`).join('')}</div>` : emptyView('나에게 맞는 하루를 만들어봐요', '반복 요일과 알림 시간을 직접 정해보세요.')}`;
+    ${routines.length ? `<div class="all-routines">${routines.map(r => `<article class="manage-card"><div class="manage-head"><h3>${escape(r.title)}</h3><input class="switch" type="checkbox" data-action="active" data-id="${r.id}" aria-label="${escape(r.title)} 사용" ${r.active ? 'checked' : ''}></div><div class="meta-line"><span class="time-pill">${r.reminderEnabled ? timeText(r) + ' 알림' : '알림 꺼짐'}</span><span>${daysText(r)}</span></div>${r.note ? `<p>${escape(r.note)}</p>` : ''}${!r.active ? '<p class="small">잠시 쉬는 중 · 기록은 그대로 보관돼요.</p>' : ''}<p class="small">${shared(r.id) ? '친구와 공유 중' : '이 기기에만 저장'}</p><div class="manage-actions">${sync.personId && !shared(r.id) ? `<button class="text-button" data-action="share" data-id="${r.id}">친구와 공유</button>` : ''}<button class="text-button danger" data-action="delete" data-id="${r.id}">삭제</button><button class="text-button" data-action="edit" data-id="${r.id}">수정</button></div></article>`).join('')}</div>` : emptyView('나에게 맞는 하루를 만들어봐요', '반복 요일과 알림 시간을 직접 정해보세요.')}`;
 }
 function settingsView() {
   const granted = notificationPermission === 'granted';
   return `<div class="page-intro"><div><span class="eyebrow">A GOOD ROUTINE STARTS HERE</span><h1>설정</h1><p>루틴이 제때 찾아올 수 있도록</p></div></div><div class="settings-grid">
     <section class="settings-card"><h2>알림</h2><p class="permission">${granted ? '● 알림 허용됨' : '○ 알림을 허용해주세요'}</p><p>${extension ? '앱 탭을 닫아도 크롬이 실행 중이면 백그라운드에서 예약을 확인합니다. 약 1분 간격으로 확인하며 크롬과 Windows 상태에 따라 늦어질 수 있어요.' : '웹 버전 알림은 이 페이지를 열어둔 동안 확인합니다. 탭을 닫은 뒤에도 알림을 받으려면 크롬 확장 버전을 사용해주세요.'}</p>${!extension && !granted ? '<button class="button primary" data-action="permission">알림 허용하기</button>' : ''}<button class="button outline" data-action="test">테스트 알림</button><p class="small">컴퓨터가 꺼져 있거나 크롬이 완전히 종료된 동안에는 알림을 보낼 수 없어요. 절전 중 알림은 복귀 후 늦게 도착할 수 있습니다. 소리는 Windows 알림·방해금지 설정을 따라요.</p></section>
-    <section class="settings-card"><h2>내 기록</h2><p>${extension ? '이 크롬 프로필' : '이 브라우저의 현재 사이트'}에만 저장돼요. 안드로이드 앱과 같은 JSON 백업 파일을 가져올 수 있어요. 자동 동기화는 아직 없습니다.</p><button class="button outline" data-action="export">백업 파일 저장</button><button class="button outline" data-action="import">백업 파일 가져오기</button><p class="small">확장 프로그램을 삭제하거나 사이트 데이터를 지우기 전에 백업해주세요. 웹 버전과 확장 버전의 저장 공간도 서로 독립적입니다.</p></section>
+    <section class="settings-card"><h2>친구·기기 동기화</h2>${sync.personId ? `<p>연결됨 · ${escape(sync.snapshot?.members?.map(m => m.displayName).join(' + ') || '공유 공간')}</p><p class="small">새 루틴은 자동 공유됩니다. 기존 루틴은 ‘내 루틴’에서 직접 공유할 수 있어요. 완료 기록은 각자 따로 저장돼요.</p><button class="button outline" data-action="sync-pull">지금 동기화</button>${sync.inviteCode ? `<p>친구 초대 코드</p><code class="pair-code">${escape(sync.inviteCode)}</code><button class="button outline" data-action="copy-code" data-code="invite">초대 코드 복사</button>` : ''}<p>내 복구 코드 (새 기기 연결)</p><code class="pair-code">${escape(sync.recoveryCode || '복구 코드는 처음 만든 기기에 표시됩니다.')}</code>${sync.recoveryCode ? '<button class="button outline" data-action="copy-code" data-code="recovery">복구 코드 복사</button>' : ''}<p class="small">복구 코드를 잃어버리면 이 사람으로 새 기기를 연결할 수 없어요. 안전한 곳에 보관하고 친구에게 보내지 마세요.</p><p class="small">마지막 동기화: ${escape(sync.lastSyncAt ? new Date(sync.lastSyncAt).toLocaleString('ko-KR') : '대기 중')}</p>` : `<p>두 사람이 같은 루틴을 보면서 완료는 각각 체크할 수 있어요. 각 기기는 인터넷이 필요합니다.</p><label>내 이름 <input id="sync-name" class="sync-input" maxlength="40" placeholder="예: 나"></label><button class="button primary" data-action="sync-create">공유 공간 만들기</button><label>친구의 초대 코드 <input id="sync-invite" class="sync-input" placeholder="gz1_..."></label><button class="button outline" data-action="sync-join">친구 공간 참여</button><label>내 복구 코드 <input id="sync-recovery" class="sync-input" placeholder="gz1_..."></label><button class="button outline" data-action="sync-restore">다른 기기 연결</button>`}</section>
+    <section class="settings-card"><h2>내 기록</h2><p>백업 파일은 이 기기의 루틴과 내 완료 기록을 저장해요. 동기화 중인 공유 루틴을 가져온 경우 서버의 기록이 우선합니다.</p><button class="button outline" data-action="export">백업 파일 저장</button><button class="button outline" data-action="import">백업 파일 가져오기</button><p class="small">${extension ? '이 크롬 프로필' : '이 브라우저의 현재 사이트'}의 저장 공간을 지우기 전에 백업과 복구 코드를 따로 보관해주세요.</p></section>
     ${!extension ? `<section class="settings-card wide"><h2>PC에서 앱처럼 사용하기</h2><p>예약 알림이 필요하면 소스의 <code>web</code> 폴더를 크롬 확장 프로그램으로 설치해주세요.</p><ol><li>크롬 주소창에 <code>chrome://extensions</code> 입력</li><li>‘개발자 모드’ 켜기</li><li>‘압축해제된 확장 프로그램을 로드합니다’ → <code>web</code> 폴더 선택</li><li>확장 프로그램 목록에서 ‘god life zzz’ 고정 후 아이콘 클릭</li></ol>${installedPrompt ? '<button class="button outline" data-action="install">웹 앱 설치하기</button>' : '<p class="small">일반 웹 앱은 크롬 메뉴 → 전송, 저장 및 공유 → 페이지를 앱으로 설치하기로 설치할 수도 있어요. 웹 앱을 설치해도 닫힌 상태에서 예약 알림은 실행되지 않습니다.</p>'}</section>` : ''}
     <section class="settings-card wide"><h2>알림이 오지 않을 때</h2><p>Windows 설정 → 시스템 → 알림에서 Chrome 알림을 확인해주세요. 절전 모드, 방해금지, 조직의 브라우저 정책 때문에 알림이 제한될 수 있습니다.${extension ? ' 크롬을 완전히 종료한 뒤에는 다시 실행해주세요.' : ' 웹 페이지를 열어두거나 크롬 확장 버전을 사용해주세요.'}</p></section>
-    </div><div class="app-about">god life zzz · v0.1.0<br>오픈소스 · MIT License · ${extension ? '크롬 확장' : '크롬 웹'} 버전</div>`;
+    </div><div class="app-about">god life zzz · v0.2.0<br>오픈소스 · MIT License · ${extension ? '크롬 확장' : '크롬 웹'} 버전</div>`;
 }
 
 function navigate(nextTab) {
@@ -181,6 +207,20 @@ $('#main').addEventListener('click', async event => {
     else if (action === 'settings') navigate('settings');
     else if (action === 'complete') await mutate('toggleComplete', { id });
     else if (action === 'active') await mutate('toggleActive', { id });
+    else if (action === 'share') confirmAction('친구와 공유할까요?', '이 루틴의 설정과 내 완료 기록이 공유 공간으로 올라갑니다. 친구의 완료는 별도로 기록돼요.', async () => { await syncAction('syncShare', { id }); toast('친구와 공유했어요.'); }, '공유');
+    else if (action === 'sync-pull') { await syncAction('syncPull'); toast('동기화했어요.'); }
+    else if (action === 'sync-create' || action === 'sync-join' || action === 'sync-restore') {
+      const kind = action.slice(5);
+      const name = $('#sync-name')?.value.trim() || '';
+      const code = (kind === 'join' ? $('#sync-invite') : $('#sync-recovery'))?.value.trim();
+      if (kind !== 'restore' && !name) throw new Error('내 이름을 입력해주세요.');
+      await syncAction('syncConnect', { kind, name, code });
+      toast('공유 공간에 연결됐어요. 복구 코드를 안전하게 보관해주세요.');
+    } else if (action === 'copy-code') {
+      const code = control.dataset.code === 'invite' ? sync.inviteCode : sync.recoveryCode;
+      if (!code) throw new Error('코드를 찾지 못했어요.');
+      await navigator.clipboard.writeText(code); toast('코드를 복사했어요.');
+    }
     else if (action === 'delete') {
       const r = routines.find(x => x.id === id);
       confirmAction('루틴을 삭제할까요?', `‘${r.title}’의 완료 기록도 삭제돼요. 필요하면 먼저 백업해주세요.`, async () => { if (await mutate('delete', { id })) toast('루틴을 삭제했어요.'); }, '삭제');
@@ -236,12 +276,14 @@ async function webTick() {
   } catch (error) { readable = false; toast(error.message); }
 }
 window.addEventListener('storage', event => { if (event.key === STORAGE) load(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { load(); if (!extension) webTick(); } });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { load().then(() => { if (!extension) webTick(); if (sync.personId) syncAction('syncPull').catch(error => toast(`동기화: ${error.message}`)); }); } });
 if (extension) chrome.storage.onChanged.addListener(changes => { if (changes.data) load(); });
 else {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(error => console.warn('오프라인 캐시:', error.message));
   window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installedPrompt = event; if (tab === 'settings') render(); });
   setInterval(webTick, 30_000);
+  setInterval(() => { if (sync.personId) syncAction('syncPull').catch(error => toast(`동기화: ${error.message}`)); }, 60_000);
 }
 await load();
 if (!extension && readable) await webTick();
+if (sync.personId) syncAction('syncPull').catch(error => toast(`동기화: ${error.message}`));

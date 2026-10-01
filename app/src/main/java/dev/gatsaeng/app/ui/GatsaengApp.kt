@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -52,7 +53,7 @@ fun GatsaengApp(
     }
     LaunchedEffect(Unit) {
         // Keep the Today tab correct if the app remains open across midnight.
-        while (true) { delay(60_000); viewModel.refresh() }
+        while (true) { delay(60_000); viewModel.refresh(); viewModel.syncNow() }
     }
 
     GatsaengTheme {
@@ -85,9 +86,10 @@ fun GatsaengApp(
                     1 -> RoutinesScreen(state,
                         onEdit = { editingId = it.id; editorVisible = true },
                         onDelete = { deleting = it }, onToggleActive = { viewModel.toggleActive(it.id) },
-                        onAdd = { editingId = null; editorVisible = true })
+                        onAdd = { editingId = null; editorVisible = true }, onShare = viewModel::share)
                     else -> SettingsScreen(state, onNotificationPermission, onExactAlarmPermission,
-                        onNotificationSettings, { viewModel.testNotification() }, onExport, onImport)
+                        onNotificationSettings, { viewModel.testNotification() }, onExport, onImport,
+                        onSync = viewModel::syncNow, onConnect = viewModel::connect)
                 }
             }
         }
@@ -157,6 +159,10 @@ private fun TodayScreen(state: RoutineState, onToggle: (String) -> Unit, onAdd: 
                         Text(if (routine.reminderEnabled) "${routine.timeText} 알림" else "알림 없이 실천", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                         val streak = routine.streak(state.today)
                         if (streak > 0) Text("연속 ${streak}회 달성", style = MaterialTheme.typography.labelSmall)
+                        if (routine.id in state.sync.sharedIds) Text(
+                            if (state.sync.friendName.isBlank()) "공유 루틴 · 친구 초대 대기 중"
+                            else "${state.sync.friendName}: ${if (routine.id in state.sync.friendDoneToday) "오늘 완료 ✓" else "아직 미완료"}",
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                     }
                     if (done) Text("완료", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(8.dp))
                 }
@@ -166,7 +172,7 @@ private fun TodayScreen(state: RoutineState, onToggle: (String) -> Unit, onAdd: 
 }
 
 @Composable
-private fun RoutinesScreen(state: RoutineState, onEdit: (Routine) -> Unit, onDelete: (Routine) -> Unit, onToggleActive: (Routine) -> Unit, onAdd: () -> Unit) {
+private fun RoutinesScreen(state: RoutineState, onEdit: (Routine) -> Unit, onDelete: (Routine) -> Unit, onToggleActive: (Routine) -> Unit, onAdd: () -> Unit, onShare: (String) -> Unit) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 100.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item {
             Column {
@@ -187,7 +193,10 @@ private fun RoutinesScreen(state: RoutineState, onEdit: (Routine) -> Unit, onDel
                     Text("${daysText(routine)} · ${if (routine.reminderEnabled) routine.timeText + " 알림" else "알림 꺼짐"}", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                     if (routine.note.isNotBlank()) Text(routine.note, style = MaterialTheme.typography.bodySmall)
                     if (!routine.active) Text("잠시 쉬는 중 · 기록은 그대로 보관돼요", style = MaterialTheme.typography.labelMedium)
+                    Text(if (routine.id in state.sync.sharedIds) "친구와 공유 중" else "이 기기에만 저장", style = MaterialTheme.typography.labelSmall)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                        if (state.sync.personId.isNotBlank() && routine.id !in state.sync.sharedIds)
+                            TextButton(onClick = { onShare(routine.id) }) { Text("친구와 공유") }
                         TextButton(onClick = { onDelete(routine) }, enabled = state.storageReadable) { Text("삭제", color = MaterialTheme.colorScheme.error) }
                         TextButton(onClick = { onEdit(routine) }, enabled = state.storageReadable) { Text("수정") }
                     }
@@ -198,7 +207,11 @@ private fun RoutinesScreen(state: RoutineState, onEdit: (Routine) -> Unit, onDel
 }
 
 @Composable
-private fun SettingsScreen(state: RoutineState, onPermission: () -> Unit, onExact: () -> Unit, onSettings: () -> Unit, onTest: () -> Unit, onExport: () -> Unit, onImport: () -> Unit) {
+private fun SettingsScreen(state: RoutineState, onPermission: () -> Unit, onExact: () -> Unit, onSettings: () -> Unit, onTest: () -> Unit, onExport: () -> Unit, onImport: () -> Unit,
+    onSync: () -> Unit, onConnect: (String, String, String) -> Unit) {
+    var name by rememberSaveable { mutableStateOf("") }
+    var invite by rememberSaveable { mutableStateOf("") }
+    var recovery by rememberSaveable { mutableStateOf("") }
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { Column { Text("설정", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold); Text("루틴이 제때 찾아올 수 있도록", color = MaterialTheme.colorScheme.onSurfaceVariant) } }
         item {
@@ -220,8 +233,36 @@ private fun SettingsScreen(state: RoutineState, onPermission: () -> Unit, onExac
         item {
             Card(shape = RoundedCornerShape(20.dp)) {
                 Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("친구·기기 동기화", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    if (state.sync.personId.isNotBlank()) {
+                        Text("공유 공간 연결됨${if (state.sync.friendName.isNotBlank()) " · ${state.sync.friendName}와 함께" else " · 친구 초대 대기 중"}")
+                        Text("새 루틴은 자동 공유됩니다. 기존 루틴은 ‘내 루틴’에서 공유하세요. 완료 기록은 각자 따로 저장돼요.", style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(onClick = onSync) { Text("지금 동기화") }
+                        if (state.sync.inviteCode.isNotBlank()) {
+                            Text("친구 초대 코드")
+                            SelectionContainer { Text(state.sync.inviteCode) }
+                        }
+                        Text("내 복구 코드 · 새 기기 연결에 필요")
+                        SelectionContainer { Text(state.sync.recoveryCode) }
+                        Text("복구 코드는 안전한 곳에 보관하고 친구에게 보내지 마세요. 잃어버리면 이 사람으로 새 기기를 연결할 수 없어요.", style = MaterialTheme.typography.bodySmall)
+                        if (state.sync.lastSyncAt.isNotBlank()) Text("마지막 동기화: ${state.sync.lastSyncAt}", style = MaterialTheme.typography.labelSmall)
+                    } else {
+                        Text("두 사람이 같은 루틴을 보면서 완료는 각각 체크할 수 있어요. 인터넷이 필요합니다.")
+                        OutlinedTextField(value = name, onValueChange = { name = it.take(40) }, label = { Text("내 이름") }, singleLine = true)
+                        Button(onClick = { onConnect("create", name, "") }, enabled = name.isNotBlank()) { Text("공유 공간 만들기") }
+                        OutlinedTextField(value = invite, onValueChange = { invite = it.trim() }, label = { Text("친구 초대 코드") }, singleLine = true)
+                        OutlinedButton(onClick = { onConnect("join", name, invite) }, enabled = name.isNotBlank() && invite.isNotBlank()) { Text("친구 공간 참여") }
+                        OutlinedTextField(value = recovery, onValueChange = { recovery = it.trim() }, label = { Text("내 복구 코드") }, singleLine = true)
+                        OutlinedButton(onClick = { onConnect("restore", "", recovery) }, enabled = recovery.isNotBlank()) { Text("다른 기기 연결") }
+                    }
+                }
+            }
+        }
+        item {
+            Card(shape = RoundedCornerShape(20.dp)) {
+                Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("내 기록", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("루틴과 완료 기록은 이 휴대폰에만 저장돼요. 앱을 삭제하기 전에 백업해주세요. 친구와 자동으로 공유되지는 않아요.", style = MaterialTheme.typography.bodyMedium)
+                    Text("백업에는 이 기기의 루틴과 내 완료 기록이 담깁니다. 공유 루틴을 가져온 경우 서버 기록이 우선합니다. 앱 삭제 전에 백업과 복구 코드를 따로 보관하세요.", style = MaterialTheme.typography.bodyMedium)
                     OutlinedButton(onClick = onExport, enabled = state.storageReadable) { Text("백업 파일 저장") }
                     OutlinedButton(onClick = onImport, enabled = state.storageReadable) { Text("백업 파일 가져오기") }
                 }
@@ -231,7 +272,7 @@ private fun SettingsScreen(state: RoutineState, onPermission: () -> Unit, onExac
         item {
             Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("god life zzz", fontWeight = FontWeight.Bold)
-                Text("v0.1.0 · 오픈소스 · MIT License", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("v0.2.0 · 오픈소스 · MIT License", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text("작은 실천을 쌓는, 우리만의 앱", style = MaterialTheme.typography.bodySmall)
             }
         }

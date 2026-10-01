@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import dev.gatsaeng.app.data.RoutineRepository
+import dev.gatsaeng.app.data.SyncRepository
 import java.time.LocalDate
 
 class RoutineAlarmReceiver : BroadcastReceiver() {
@@ -28,20 +29,27 @@ class RoutineAlarmReceiver : BroadcastReceiver() {
 
 class CompleteRoutineReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        runCatching {
-            val id = intent.getStringExtra(AlarmScheduler.EXTRA_ID) ?: return
-            val date = LocalDate.parse(intent.getStringExtra(AlarmScheduler.EXTRA_DATE) ?: return)
-            val repository = RoutineRepository(context)
+        val pending = goAsync()
+        val appContext = context.applicationContext
+        Thread {
+          try { runCatching {
+            val id = intent.getStringExtra(AlarmScheduler.EXTRA_ID) ?: return@Thread
+            val date = LocalDate.parse(intent.getStringExtra(AlarmScheduler.EXTRA_DATE) ?: return@Thread)
+            val repository = RoutineRepository(appContext)
             val routines = repository.load()
-            val routine = routines.find { it.id == id } ?: return
-            if (date > LocalDate.now() || date < routine.createdOn) return
+            val routine = routines.find { it.id == id } ?: return@Thread
+            if (date > LocalDate.now() || date < routine.createdOn) return@Thread
+            val sync = SyncRepository(appContext)
+            if (id in sync.info().sharedIds) sync.complete(id, date, true)
             val updated = routine.copy(completedDates = routine.completedDates + date)
             repository.save(routines.map { if (it.id == id) updated else it })
-            AlarmScheduler(context).apply {
+            AlarmScheduler(appContext).apply {
                 clearNotification(id)
                 schedule(updated)
             }
-        }.onFailure { Log.e("RoutineComplete", "Completion failed", it) }
+          }.onFailure { Log.e("RoutineComplete", "Completion failed", it) }
+          } finally { pending.finish() }
+        }.start()
     }
 }
 

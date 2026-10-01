@@ -2,12 +2,18 @@ package dev.gatsaeng.app
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import dev.gatsaeng.app.data.RoutineCodec
 import dev.gatsaeng.app.data.RoutineRepository
+import dev.gatsaeng.app.data.SyncInfo
+import dev.gatsaeng.app.data.SyncRepository
 import dev.gatsaeng.app.model.Routine
 import dev.gatsaeng.app.notifications.AlarmScheduler
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.LocalDate
 
 data class RoutineState(
@@ -17,16 +23,18 @@ data class RoutineState(
     val exactAlarmsAllowed: Boolean = false,
     val storageReadable: Boolean = true,
     val error: String? = null,
+    val sync: SyncInfo = SyncInfo(),
 )
 
 class RoutineViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = RoutineRepository(application)
     private val scheduler = AlarmScheduler(application)
+    private val syncRepository = SyncRepository(application)
     private val mutableState = MutableStateFlow(RoutineState())
     private var scheduleInitialized = false
     val state = mutableState.asStateFlow()
 
-    init { refresh() }
+    init { refresh(); syncNow() }
 
     fun refresh() {
         try {
@@ -39,7 +47,8 @@ class RoutineViewModel(application: Application) : AndroidViewModel(application)
                 scheduler.scheduleAll(routines)
                 scheduleInitialized = true
             }
-            mutableState.value = RoutineState(routines, LocalDate.now(), notificationsAllowed, exactAllowed)
+            mutableState.value = RoutineState(routines, LocalDate.now(), notificationsAllowed, exactAllowed,
+                sync = syncRepository.info())
         } catch (error: Exception) {
             mutableState.value = mutableState.value.copy(storageReadable = false,
                 error = "기록을 불러오지 못했어요. 기존 데이터는 보존됩니다. ${error.message.orEmpty()}")
@@ -67,7 +76,47 @@ class RoutineViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun save(routine: Routine): Boolean = change { list ->
+    private fun remote(action: () -> Unit) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { action() }
+                syncNow()
+            } catch (error: Exception) { reportError(error.message ?: "동기화하지 못했어요.") }
+        }
+    }
+
+    fun syncNow() {
+        if (syncRepository.info().personId.isBlank()) return
+        viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { syncRepository.pull(repository.load()) }
+                change { result.first.routines }
+                mutableState.value = mutableState.value.copy(sync = result.second)
+            } catch (error: Exception) { reportError("동기화: ${error.message ?: "서버에 연결하지 못했어요."}") }
+        }
+    }
+
+    fun connect(kind: String, name: String, code: String) = remote {
+        syncRepository.connect(kind, name, code)
+    }
+
+    fun share(id: String) = remote {
+        val routine = repository.load().find { it.id == id } ?: error("루틴을 찾지 못했어요.")
+        syncRepository.share(routine)
+    }
+
+    fun save(routine: Routine): Boolean {
+        val info = syncRepository.info()
+        val existing = mutableState.value.routines.find { it.id == routine.id }
+        if (info.personId.isNotBlank() && (existing == null || routine.id in info.sharedIds)) {
+            remote {
+                if (existing == null) syncRepository.share(routine)
+                else syncRepository.put(routine.copy(completedDates = existing.completedDates,
+                    createdOn = existing.createdOn), info.revisions[routine.id] ?: error("루틴 버전을 읽지 못했어요."))
+            }
+            return true
+        }
+        return change { list ->
         val existing = list.find { it.id == routine.id }
         if (existing == null) {
             require(list.size < 500) { "루틴은 최대 500개까지 추가할 수 있어요." }
@@ -77,15 +126,41 @@ class RoutineViewModel(application: Application) : AndroidViewModel(application)
             lastRemindedDate = if (existing.hour != routine.hour || existing.minute != routine.minute) null else existing.lastRemindedDate,
             createdOn = existing.createdOn,
         ) else it }
+        }
     }
 
-    fun delete(id: String) = change { list -> list.filterNot { it.id == id } }
-    fun toggleActive(id: String) = change { list -> list.map { if (it.id == id) it.copy(active = !it.active) else it } }
-    fun toggleComplete(id: String) = change { list ->
+    fun delete(id: String): Boolean {
+        val info = syncRepository.info()
+        if (id in info.sharedIds) {
+            remote { syncRepository.remove(id, info.revisions[id] ?: error("루틴 버전을 읽지 못했어요.")) }
+            return true
+        }
+        return change { list -> list.filterNot { it.id == id } }
+    }
+    fun toggleActive(id: String): Boolean {
+        val info = syncRepository.info()
+        if (id in info.sharedIds) {
+            val routine = mutableState.value.routines.find { it.id == id } ?: return false
+            remote { syncRepository.put(routine.copy(active = !routine.active),
+                info.revisions[id] ?: error("루틴 버전을 읽지 못했어요.")) }
+            return true
+        }
+        return change { list -> list.map { if (it.id == id) it.copy(active = !it.active) else it } }
+    }
+    fun toggleComplete(id: String): Boolean {
+        val info = syncRepository.info()
+        if (id in info.sharedIds) {
+            val routine = mutableState.value.routines.find { it.id == id } ?: return false
+            if (!routine.isDue(LocalDate.now())) return false
+            remote { syncRepository.complete(id, LocalDate.now(), !routine.isCompleted(LocalDate.now())) }
+            return true
+        }
+        return change { list ->
         val date = LocalDate.now()
         list.map { r ->
             if (r.id != id || !r.isDue(date)) r else r.copy(completedDates =
                 if (r.isCompleted(date)) r.completedDates - date else r.completedDates + date)
+        }
         }
     }
 
