@@ -1,0 +1,11 @@
+{
+  "name": "god life zzz",
+  "short_name": "god life zzz",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f5f6ef",
+  "theme_color": "#176c52",
+  "icons": [{ "src": "icons/icon192.png", "sizes": "192x192", "type": "image/png" }, { "src": "icons/icon512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }]
+}
